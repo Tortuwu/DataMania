@@ -1,0 +1,408 @@
+# ================================================
+# Pipeline Completo para Predicción de Huevos de Dengue
+# (VERSIÓN SIN TRANSFORMACIÓN LOGARÍTMICA)
+# ================================================
+#
+# Este script combina todas las celdas del notebook
+# en el orden correcto de ejecución, pero entrena
+# el modelo directamente sobre la variable 'eggs' original.
+#
+# ================================================
+
+# =======================
+#  1. Importar librerías
+# =======================
+print("--- 1. Importando librerías ---")
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from google.colab import files
+from scipy.spatial import cKDTree
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from xgboost import XGBRegressor
+import warnings
+import os # Para la instalación silenciosa
+
+# Ignorar advertencias futuras
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+# =============================
+# 2. Subir archivos al entorno
+# =============================
+print("\n--- 2. Subiendo archivos ---")
+# Descomentar estas líneas si corres en Colab y necesitas subir los archivos
+# print("👉 Sube el archivo 'covariables_con_decimales.xlsx'")
+# covar_file = files.upload()
+# print("👉 Sube el archivo 'eggs_data.csv'")
+# eggs_file = files.upload()
+
+# --- PARA PRUEBAS SIN SUBIR ARCHIVOS (Usa nombres de archivo locales) ---
+covar_filename = 'covariables_con_decimales.xlsx'
+eggs_filename = 'eggs_data.csv'
+# ---------------------------------------------------------------------
+
+
+# ============================
+# 3. Cargar y limpiar nombres
+# ============================
+print("\n--- 3. Cargando y limpiando datos ---")
+try:
+    # --- Usa esto si subiste los archivos ---
+    # covar_df = pd.read_excel(list(covar_file.keys())[0])
+    # eggs_df = pd.read_csv(list(eggs_file.keys())[0])
+    # --- Usa esto si usas archivos locales ---
+    covar_df = pd.read_excel(covar_filename)
+    eggs_df = pd.read_csv(eggs_filename)
+    # ----------------------------------------
+
+    covar_df.columns = [c.strip().lower() for c in covar_df.columns]
+    eggs_df.columns = [c.strip().lower() for c in eggs_df.columns]
+
+    print("Covariables:", covar_df.shape)
+    print("Eggs data:", eggs_df.shape)
+
+except FileNotFoundError:
+    print(f"❌ Error: No se encontraron los archivos '{covar_filename}' o '{eggs_filename}'.")
+    exit()
+except Exception as e:
+    print(f"❌ Error al cargar los archivos: {e}")
+    exit()
+
+# =========================================================
+# 4. Combinar bases por coordenadas (unión por proximidad)
+# =========================================================
+print("\n--- 4. Combinando bases por coordenadas ---")
+covar_df.columns = [c.strip().lower() for c in covar_df.columns]
+eggs_df.columns  = [c.strip().lower() for c in eggs_df.columns]
+covar_df = covar_df.rename(columns={"longitud_dec":"x", "latitud_dec":"y"}, errors="ignore")
+eggs_df  = eggs_df.rename(columns={"longitud_dec":"x", "latitud_dec":"y"}, errors="ignore")
+
+for col in ["x","y"]:
+    if col in covar_df: covar_df[col] = pd.to_numeric(covar_df[col], errors="coerce")
+    if col in eggs_df:  eggs_df[col]  = pd.to_numeric(eggs_df[col],  errors="coerce")
+
+print("Imputando coordenadas (x, y) faltantes con la mediana...")
+for df_temp, nombre_df in [(covar_df, "covariables"), (eggs_df, "eggs_data")]:
+    for col in ["x", "y"]:
+        if col in df_temp and df_temp[col].isna().any():
+            mediana = df_temp[col].median()
+            if pd.isna(mediana):
+                print(f"⚠️ Toda la columna '{col}' en {nombre_df} es NaN. Rellenando con 0.")
+                mediana = 0
+            n_nans = df_temp[col].isna().sum()
+            print(f"  Imputando {n_nans} NaNs en '{col}' de {nombre_df} con {mediana:.4f}")
+            df_temp[col] = df_temp[col].fillna(mediana)
+
+covar_df = covar_df.dropna(subset=["x","y"])
+eggs_df = eggs_df.dropna(subset=["x","y"])
+print(f"  Tamaños post-imputación: covar={len(covar_df)}, eggs={len(eggs_df)}")
+
+if covar_df.empty or eggs_df.empty:
+    raise ValueError("Uno de los dataframes (covar o eggs) está vacío después de limpiar coordenadas.")
+
+print(f"  Columnas en covar_df: {list(covar_df.columns)}")
+print(f"  Columnas en eggs_df: {list(eggs_df.columns)}")
+tree = cKDTree(covar_df[["x","y"]].to_numpy())
+dist, idx = tree.query(eggs_df[["x","y"]].to_numpy(), k=1)
+
+tol = 0.08
+mask = dist <= tol
+eggs_matched  = eggs_df.loc[mask].reset_index(drop=True)
+covar_matched = covar_df.iloc[idx[mask]].reset_index(drop=True)
+
+df = pd.concat([eggs_matched, covar_matched.drop(columns=["x","y"], errors="ignore")], axis=1)
+print(f"Filas unidas por proximidad: {len(df)} de {len(eggs_df)}")
+
+
+# ===============================================
+# 5. Limpieza de predictoras (X) - make numeric y OHE
+# ===============================================
+print("\n--- 5. Limpiando variables predictoras (X) ---")
+target = "eggs"
+
+numerical_features = [
+   # "vph_pisoti","vph_c_elec","vph_s_elec","vph_aeasp",
+    "vph_letr",
+    "vph_drenaj"
+    #"vph_lavad","graproes","precip_promedio","evap","tem_p_semana"
+]
+categorical_features = ["week"]
+
+existing_numerical = [col for col in numerical_features if col in df.columns]
+existing_categorical = [col for col in categorical_features if col in df.columns]
+
+if not existing_numerical or not existing_categorical:
+    print("⚠️ Advertencia: Algunas columnas numéricas o categóricas no se encontraron en 'df'.")
+
+X_num = df[existing_numerical].copy()
+X_cat = df[existing_categorical].copy()
+y_original = df[target].astype(float) # Esta es ahora nuestra Y principal
+
+print("Procesando variables numéricas...")
+bad_tokens = {"*","NA","N/A","na","-","—","", "sd", "s/d"}
+X_num = X_num.map(lambda v: np.nan if (isinstance(v, str) and v.strip() in bad_tokens) else v)
+for c in X_num.columns:
+    X_num[c] = pd.to_numeric(X_num[c], errors="coerce")
+nan_report = X_num.isna().sum().sort_values(ascending=False)
+print("  NaNs por columna (numéricas) tras coerción:\n", nan_report[nan_report > 0])
+all_nan_cols = [c for c in X_num.columns if X_num[c].isna().all()]
+if all_nan_cols:
+    print("⚠️ Columnas numéricas removidas por quedar totalmente en NaN:", all_nan_cols)
+    X_num = X_num.drop(columns=all_nan_cols)
+if not X_num.empty:
+    medianas = X_num.median(numeric_only=True)
+    X_num = X_num.fillna(medianas)
+    print("  Imputación con mediana completa (numéricas).")
+else:
+    print("⚠️ No quedaron variables numéricas después de la limpieza.")
+
+print("\nAplicando One-Hot Encoding a 'week'...")
+if not X_cat.empty:
+    if X_cat['week'].isna().any():
+        if not X_cat['week'].mode().empty:
+            moda_week = X_cat['week'].mode()[0]
+            print(f"  Imputando {X_cat['week'].isna().sum()} NaNs en 'week' con la moda: {moda_week}")
+            X_cat['week'] = X_cat['week'].fillna(moda_week)
+        else:
+            print("⚠️ Columna 'week' es toda NaN, rellenando con 'desconocido'")
+            X_cat['week'] = X_cat['week'].fillna('desconocido')
+    X_cat['week'] = X_cat['week'].astype(str)
+    X_ohe = pd.get_dummies(X_cat, columns=['week'], prefix='week', drop_first=False)
+    print(f"  Se crearon {X_ohe.shape[1]} columnas OHE para 'week'.")
+else:
+    print("⚠️ No se encontró la columna 'week' para OHE.")
+    X_ohe = pd.DataFrame()
+
+X = pd.concat([X_num.reset_index(drop=True), X_ohe.reset_index(drop=True)], axis=1)
+print("\nForma de X (antes de features espaciales):", X.shape)
+
+
+# ===============================================
+# 6. Análisis Exploratorio Espacial (ESDA - LISA)
+# ===============================================
+print("\n--- 6. Iniciando Análisis Exploratorio Espacial (LISA) ---")
+
+print("Instalando librerías espaciales (geopandas, pysal, esda, splot)...")
+try:
+    os.system('pip install geopandas pysal esda splot --quiet')
+    print("¡Librerías instaladas!")
+except Exception as e:
+    print(f"No se pudo instalar con 'os'. Error: {e}")
+    # !pip install geopandas pysal esda splot --quiet
+
+try:
+    import geopandas as gpd
+    from pysal.lib import weights
+    from pysal.explore import esda
+    from splot.esda import lisa_cluster
+    print("Librerías espaciales cargadas.")
+except ImportError:
+    print("❌ Error: No se pudieron importar las librerías espaciales.")
+    exit()
+
+print("Preparando datos espaciales...")
+gdf = gpd.GeoDataFrame(
+    df, geometry=gpd.points_from_xy(df.x, df.y), crs="EPSG:4326"
+)
+# *** CAMBIO AQUÍ: Usar y_original para el análisis espacial ***
+y_esda = y_original # Usamos la Y original para Moran y LISA
+gdf['eggs'] = y_esda # Añadir al GeoDataFrame para LISA
+
+print("Calculando matriz de pesos espaciales (k=8 vecinos)...")
+try:
+    wq = weights.KNN.from_dataframe(gdf, k=4)
+    wq.transform = 'r'
+except Exception as e:
+    print(f"❌ Error al crear la matriz de pesos: {e}")
+    exit()
+
+print("\nCalculando Moran's I Global (sobre 'eggs' original)...")
+try:
+    mi_global = esda.Moran(y_esda, wq) # *** Usar y_esda (original) ***
+    print(f"  Estadístico Moran's I Global: {mi_global.I:.4f}")
+    print(f"  P-valor (Global): {mi_global.p_sim:.4f}")
+    if mi_global.p_sim < 0.05:
+        print("  Interpretación: ¡Autocorrelación Global SIGNIFICATIVA!")
+    else:
+        print("  Interpretación: Autocorrelación Global NO significativa.")
+except Exception as e:
+    print(f"❌ Error al calcular Moran Global: {e}")
+
+print("\nCalculando I de Moran Local (LISA) (sobre 'eggs' original)...")
+try:
+    lisa = esda.Moran_Local(y_esda, wq) # *** Usar y_esda (original) ***
+except Exception as e:
+    print(f"❌ Error al calcular LISA: {e}")
+    exit()
+
+print("Generando Gráfico: Mapa de Clusters LISA (sobre 'eggs' original)...")
+try:
+    fig, ax = plt.subplots(figsize=(12, 10))
+    lisa_cluster(lisa, gdf, p=0.05, ax=ax, legend=True)
+    ax.set_title("Mapa de Clusters (LISA) para eggs (original)") # *** Título cambiado ***
+    ax.set_xlabel("Longitud (x)")
+    ax.set_ylabel("Latitud (y)")
+    plt.show()
+except Exception as e:
+    print(f"❌ Error al generar el mapa LISA: {e}")
+
+
+# ================================================
+# 7. Ingeniería de Variables Espaciales
+# ================================================
+print("\n--- 7. Creando variables espaciales ---")
+
+print("Calculando 'Spatial Lag' (sobre 'eggs' original)...")
+# *** CAMBIO AQUÍ: Usar y_original para y_lag ***
+y_lag = weights.lag_spatial(wq, y_original)
+spatial_lag_df = pd.DataFrame(y_lag, columns=['y_lag'], index=gdf.index)
+
+print("Creando variable categórica de clusters LISA...")
+lisa_quadrant_df = pd.DataFrame(lisa.q, columns=['lisa_q'], index=gdf.index)
+lisa_quadrant_df['lisa_q'] = lisa_quadrant_df['lisa_q'].map({
+    1: 'HH_HotSpot', 2: 'LH_Outlier', 3: 'LL_ColdSpot',
+    4: 'HL_Outlier', 0: 'NS_NoSig'
+})
+lisa_ohe = pd.get_dummies(lisa_quadrant_df, columns=['lisa_q'], drop_first=True)
+
+print("Uniendo 'X' original con las nuevas variables espaciales...")
+X_original_fe = X.reset_index(drop=True) # Usar X de la sección 5
+X_spatial = pd.concat([X_original_fe, spatial_lag_df, lisa_ohe], axis=1)
+X_spatial = X_spatial.fillna(0)
+
+print("\n✅ Se creó la nueva matriz 'X_spatial'.")
+print(f"  Forma 'X' original: {X_original_fe.shape}")
+print(f"  Forma 'X_spatial' nueva: {X_spatial.shape}")
+
+
+# ================================================
+# 8. División Train / Test (con X_spatial y SIN Log)
+# ================================================
+print("\n--- 8. Dividiendo datos para entrenamiento y prueba (SIN Log) ---")
+
+# *** CAMBIO AQUÍ: Usar y_original para el split ***
+print("Dividiendo 'X_spatial' y 'y_original'...")
+X_train, X_test, y_train, y_test = train_test_split(
+    X_spatial, y_original, test_size=0.2, random_state=42
+)
+
+# Ya no necesitamos y_train_orig, y_test_orig
+
+print("\n✅ ¡División completada!")
+print(f"  X_train: {X_train.shape}, y_train: {y_train.shape}")
+print(f"  X_test:  {X_test.shape}, y_test:  {y_test.shape}")
+
+
+# ================================================
+# 9. Entrenar XGBoost Regressor (SIN Log)
+# ================================================
+print("\n--- 9. Entrenando modelo XGBoost (SIN Log) ---")
+
+params = {
+    'n_estimators': [200],
+    'max_depth': [3],
+    'learning_rate': [0.05],
+    'subsample': [0.8],
+}
+reg = XGBRegressor(random_state=42, n_jobs=-1, objective='reg:squarederror')
+grid = GridSearchCV(
+    reg, param_grid=params, scoring="neg_mean_squared_error",
+    cv=5, n_jobs=-1, verbose=1, error_score='raise'
+)
+
+print("Iniciando GridSearchCV con XGBoost...")
+total_combinaciones = np.prod([len(v) for v in params.values()])
+print(f"Probando {total_combinaciones} combinaciones...")
+
+try:
+    grid.fit(X_train, y_train) # *** Entrenar con y_train (original) ***
+    print("\n✅ ¡GridSearchCV completado!")
+    print("Mejor configuración encontrada (o usada):", grid.best_params_)
+    best_model = grid.best_estimator_
+
+except Exception as e:
+    print(f"❌ Error durante el GridSearchCV: {e}")
+    best_model = None
+
+
+# ================================================
+# 10. Evaluación del Modelo (SIN Log)
+# ================================================
+print("\n--- 10. Evaluando el modelo (SIN Log) ---")
+
+if best_model is None:
+    print("❌ No se pudo evaluar.")
+else:
+    try:
+        # *** CAMBIO AQUÍ: Predecir directamente (sin log) ***
+        y_pred_train = best_model.predict(X_train)
+        y_pred_test  = best_model.predict(X_test)
+
+        # *** CAMBIO AQUÍ: No hay necesidad de revertir ***
+        y_pred_train[y_pred_train < 0] = 0 # Asegurar no negativos
+        y_pred_test[y_pred_test < 0] = 0
+
+        print("\nCalculando métricas contra 'y' original...")
+        # *** CAMBIO AQUÍ: Comparar contra y_train y y_test (que son originales) ***
+        mae_train = mean_absolute_error(y_train, y_pred_train)
+        mae_test  = mean_absolute_error(y_test,  y_pred_test)
+        rmse_train = np.sqrt(mean_squared_error(y_train, y_pred_train))
+        rmse_test  = np.sqrt(mean_squared_error(y_test,  y_pred_test))
+        r2_train = r2_score(y_train, y_pred_train)
+        r2_test  = r2_score(y_test,  y_pred_test)
+
+        print("\n--- Métricas de Evaluación (sobre 'y' original) ---")
+        print(f"Train -> MAE: {mae_train:.3f} | RMSE: {rmse_train:.3f} | R²: {r2_train:.3f}")
+        print(f"Test  -> MAE: {mae_test:.3f} | RMSE: {rmse_test:.3f} | R²: {r2_test:.3f}")
+
+        if r2_test > 0.1:
+            print("\n¡Éxito! El R² es positivo y significativo.")
+        elif r2_test > 0:
+            print("\n¡Mejora! El R² es positivo, pero bajo.")
+        else:
+            print("\nResultado: El R² sigue siendo negativo o cero.")
+            print("El sesgo en 'y' probablemente sigue afectando el rendimiento.")
+
+    except Exception as e:
+        print(f"❌ Error durante la evaluación: {e}")
+
+
+# ================================================
+# 11. Importancia de las variables
+# ================================================
+print("\n--- 11. Calculando Importancia de Variables ---")
+
+if best_model is None or 'X_train' not in locals():
+     print("❌ No se puede calcular la importancia.")
+else:
+    try:
+        importances = best_model.feature_importances_
+        feature_names = X_train.columns
+
+        imp_df = pd.DataFrame({"Variable": feature_names, "Importancia": importances})
+        imp_df = imp_df.sort_values("Importancia", ascending=False)
+
+        print("Generando gráfica de importancia (Top 20)...")
+        plt.figure(figsize=(10, 8))
+        top_20_imp = imp_df.head(20).iloc[::-1]
+        plt.barh(top_20_imp["Variable"], top_20_imp["Importancia"])
+        plt.title("Importancia de variables (Top 20)")
+        plt.xlabel("Importancia (según XGBoost)")
+        plt.tight_layout()
+        plt.show()
+
+        print("\nTabla de Importancia (Top 20):")
+        print(imp_df.head(20))
+
+        # Comprobar si 'y_lag' sigue siendo importante
+        if not imp_df.empty and 'y_lag' in imp_df.iloc[0, 0]:
+             print("\nNota: 'y_lag' (calculado sobre 'eggs' original) sigue siendo importante.")
+        elif not imp_df.empty:
+             print(f"\nNota: La variable más importante ahora es '{imp_df.iloc[0, 0]}'.")
+
+
+    except Exception as e:
+        print(f"❌ Error durante el cálculo de importancia: {e}")
+
+print("\n--- Fin del Pipeline ---")
