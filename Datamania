@@ -2,7 +2,7 @@
 # Pipeline Completo para Predicción de Huevos de Dengue
 # (VERSIÓN SIN TRANSFORMACIÓN LOGARÍTMICA)
 #
-# v2.0 - Añadido mapeo sobre Shapefile
+# v2.2 - Corregido para ejecución local (limpieza de CSV y errores de índice)
 # ================================================
 #
 # Este script combina todas las celdas del notebook
@@ -58,7 +58,9 @@ print("\n--- 3. Cargando y limpiando datos ---")
 try:
     # --- Carga directa de archivos locales ---
     covar_df = pd.read_excel(covar_filename)
-    eggs_df = pd.read_csv(eggs_filename)
+    
+    # *** CORRECCIÓN 1: Se añade 'header=1' para saltar la línea mala ("<<<<<<< HEAD") ***
+    eggs_df = pd.read_csv(eggs_filename, header=1)
     # ----------------------------------------
 
     covar_df.columns = [c.strip().lower() for c in covar_df.columns]
@@ -79,10 +81,15 @@ except Exception as e:
 # 4. Combinar bases por coordenadas (unión por proximidad)
 # =========================================================
 print("\n--- 4. Combinando bases por coordenadas ---")
-covar_df.columns = [c.strip().lower() for c in covar_df.columns]
-eggs_df.columns  = [c.strip().lower() for c in eggs_df.columns]
+# covar_df.columns = [c.strip().lower() for c in covar_df.columns] # Ya se hizo en Sección 3
+# eggs_df.columns  = [c.strip().lower() for c in eggs_df.columns] # Ya se hizo en Sección 3
+
+# Esta línea es correcta, 'covariables' SÍ tiene 'longitud_dec' y 'latitud_dec'
 covar_df = covar_df.rename(columns={"longitud_dec":"x", "latitud_dec":"y"}, errors="ignore")
-eggs_df  = eggs_df.rename(columns={"longitud_dec":"x", "latitud_dec":"y"}, errors="ignore")
+
+# *** CORRECCIÓN 2: 'eggs_data.csv' YA tiene 'x' e 'y', así que esta línea se comenta ***
+# eggs_df  = eggs_df.rename(columns={"longitud_dec":"x", "latitud_dec":"y"}, errors="ignore")
+
 
 for col in ["x","y"]:
     if col in covar_df: covar_df[col] = pd.to_numeric(covar_df[col], errors="coerce")
@@ -100,6 +107,7 @@ for df_temp, nombre_df in [(covar_df, "covariables"), (eggs_df, "eggs_data")]:
             print(f"    Imputando {n_nans} NaNs en '{col}' de {nombre_df} con {mediana:.4f}")
             df_temp[col] = df_temp[col].fillna(mediana)
 
+# Esta línea (la que daba el primer KeyError) ahora funcionará
 covar_df = covar_df.dropna(subset=["x","y"])
 eggs_df = eggs_df.dropna(subset=["x","y"])
 print(f"    Tamaños post-imputación: covar={len(covar_df)}, eggs={len(eggs_df)}")
@@ -127,6 +135,21 @@ print(f"Filas unidas por proximidad: {len(df)} de {len(eggs_df)}")
 print("\n--- 5. Limpiando variables predictoras (X) ---")
 target = "eggs"
 
+# *** CORRECCIÓN 3: Limpiar filas corruptas (de conflictos de Git) ***
+# Forzar la conversión de la columna 'target' a numérico.
+# 'errors='coerce'' convertirá cualquier texto (como 'eggs' o '=======') en NaN.
+print(f"Coercionando columna target '{target}' a numérico para limpiar basura...")
+original_len = len(df)
+df[target] = pd.to_numeric(df[target], errors='coerce')
+
+# Ahora, eliminamos las filas donde el target se convirtió en NaN (filas corruptas).
+df = df.dropna(subset=[target])
+new_len = len(df)
+if original_len > new_len:
+    print(f"    Se eliminaron {original_len - new_len} filas con valores no numéricos en '{target}'.")
+# *** FIN DE LA CORRECCIÓN 3 ***
+
+
 numerical_features = [
     "vph_pisoti","vph_c_elec","vph_s_elec","vph_aeasp",
     "vph_aguafv","vph_tinaco","vph_letr",
@@ -135,14 +158,17 @@ numerical_features = [
 ]
 categorical_features = ["week"]
 
-existing_numerical = [col for col in numerical_features if col in df.columns]
-existing_categorical = [col for col in categorical_features if col in df.columns]
+df_cols_lower = [str(c).lower() for c in df.columns]
+existing_numerical = [col for col in numerical_features if col in df_cols_lower]
+existing_categorical = [col for col in categorical_features if col in df_cols_lower]
 
 if not existing_numerical or not existing_categorical:
     print("⚠ Advertencia: Algunas columnas numéricas o categóricas no se encontraron en 'df'.")
 
 X_num = df[existing_numerical].copy()
 X_cat = df[existing_categorical].copy()
+
+# Esta línea (la que daba el segundo ValueError) ahora funcionará
 y_original = df[target].astype(float) # Esta es ahora nuestra Y principal
 
 print("Procesando variables numéricas...")
@@ -180,7 +206,8 @@ else:
     print("⚠ No se encontró la columna 'week' para OHE.")
     X_ohe = pd.DataFrame()
 
-X = pd.concat([X_num.reset_index(drop=True), X_ohe.reset_index(drop=True)], axis=1)
+# *** CORRECCIÓN 4: Quitar reset_index para mantener el índice original ***
+X = pd.concat([X_num, X_ohe], axis=1)
 print("\nForma de X (antes de features espaciales):", X.shape)
 
 
@@ -189,32 +216,13 @@ print("\nForma de X (antes de features espaciales):", X.shape)
 # ===============================================
 print("\n--- 6. Iniciando Análisis Exploratorio Espacial (LISA) ---")
 
-# *** MODIFICADO: Librerías ya importadas en la Sección 1 ***
-# print("Instalando librerías espaciales (geopandas, pysal, esda, splot)...")
-# try:
-#       os.system('pip install geopandas pysal esda splot --quiet')
-#       print("¡Librerías instaladas!")
-# except Exception as e:
-#       print(f"No se pudo instalar con 'os'. Error: {e}")
-#       # !pip install geopandas pysal esda splot --quiet
-
-# try:
-#       import geopandas as gpd
-#       from pysal.lib import weights
-#       from pysal.explore import esda
-#       from splot.esda import lisa_cluster
-#       print("Librerías espaciales cargadas.")
-# except ImportError:
-#       print("❌ Error: No se pudieron importar las librerías espaciales.")
-#       exit()
 print("Librerías espaciales (geopandas, pysal, esda, splot) ya cargadas.")
 
-
 print("Preparando datos espaciales...")
+# Se usa 'df' (ya limpio) para crear el GeoDataFrame
 gdf = gpd.GeoDataFrame(
     df, geometry=gpd.points_from_xy(df.x, df.y), crs="EPSG:4326"
 )
-# *** CAMBIO AQUÍ: Usar y_original para el análisis espacial ***
 y_esda = y_original # Usamos la Y original para Moran y LISA
 gdf['eggs'] = y_esda # Añadir al GeoDataFrame para LISA
 
@@ -263,7 +271,6 @@ except Exception as e:
 print("\n--- 7. Creando variables espaciales ---")
 
 print("Calculando 'Spatial Lag' (sobre 'eggs' original)...")
-# *** CAMBIO AQUÍ: Usar y_original para y_lag ***
 y_lag = weights.lag_spatial(wq, y_original)
 spatial_lag_df = pd.DataFrame(y_lag, columns=['y_lag'], index=gdf.index)
 
@@ -276,7 +283,8 @@ lisa_quadrant_df['lisa_q'] = lisa_quadrant_df['lisa_q'].map({
 lisa_ohe = pd.get_dummies(lisa_quadrant_df, columns=['lisa_q'], drop_first=True)
 
 print("Uniendo 'X' original con las nuevas variables espaciales...")
-X_original_fe = X.reset_index(drop=True) # Usar X de la sección 5
+# *** CORRECCIÓN 5: Asignar X directamente (sin reset_index) ***
+X_original_fe = X # Usar X de la sección 5 (con el índice correcto)
 X_spatial = pd.concat([X_original_fe, spatial_lag_df, lisa_ohe], axis=1)
 X_spatial = X_spatial.fillna(0)
 
@@ -290,8 +298,8 @@ print(f"    Forma 'X_spatial' nueva: {X_spatial.shape}")
 # ================================================
 print("\n--- 8. Dividiendo datos para entrenamiento y prueba (SIN Log) ---")
 
-# *** CAMBIO AQUÍ: Usar y_original para el split ***
 print("Dividiendo 'X_spatial' y 'y_original'...")
+# Esta línea (la que daba el tercer ValueError) ahora funcionará
 X_train, X_test, y_train, y_test = train_test_split(
     X_spatial, y_original, test_size=0.2, random_state=42
 )
@@ -344,16 +352,13 @@ if best_model is None:
     print("❌ No se pudo evaluar.")
 else:
     try:
-        # *** CAMBIO AQUÍ: Predecir directamente (sin log) ***
         y_pred_train = best_model.predict(X_train)
         y_pred_test  = best_model.predict(X_test)
 
-        # *** CAMBIO AQUÍ: No hay necesidad de revertir ***
         y_pred_train[y_pred_train < 0] = 0 # Asegurar no negativos
         y_pred_test[y_pred_test < 0] = 0
 
         print("\nCalculando métricas contra 'y' original...")
-        # *** CAMBIO AQUÍ: Comparar contra y_train y y_test (que son originales) ***
         mae_train = mean_absolute_error(y_train, y_pred_train)
         mae_test  = mean_absolute_error(y_test,  y_pred_test)
         rmse_train = np.sqrt(mean_squared_error(y_train, y_pred_train))
@@ -404,7 +409,6 @@ else:
         print("\nTabla de Importancia (Top 20):")
         print(imp_df.head(20))
 
-        # Comprobar si 'y_lag' sigue siendo importante
         if not imp_df.empty and 'y_lag' in imp_df.iloc[0, 0]:
              print("\nNota: 'y_lag' (calculado sobre 'eggs' original) sigue siendo importante.")
         elif not imp_df.empty:
@@ -432,16 +436,12 @@ else:
         # Predecir sobre todos los datos
         all_predictions = best_model.predict(X_spatial)
         
-        # Asegurar que no haya predicciones negativas
         all_predictions[all_predictions < 0] = 0
         
-        # Añadir las predicciones al GeoDataFrame original para mapear
-        # Asegurándonos de que los índices coincidan
         gdf['predicted_eggs'] = all_predictions
         
         print("✅ Predicciones generadas y añadidas al GeoDataFrame como 'predicted_eggs'.")
         
-        # Mostrar un resumen comparativo
         print("\nResumen comparativo (Original vs. Predicho):")
         print(gdf[['eggs', 'predicted_eggs']].describe())
 
@@ -451,7 +451,6 @@ else:
 
 # ================================================
 # 13. Mapeo de Predicciones (con Shapefile)
-# *** SECCIÓN MODIFICADA ***
 # ================================================
 print("\n--- 13. Mapeo de Predicciones (con Shapefile) ---")
 
@@ -461,7 +460,6 @@ else:
     try:
         # --- Carga del Shapefile ---
         print(f"Cargando mapa base desde: {shapefile_filename}")
-        # 'shapefile_filename' debe estar definida en la Sección 2
         mapa_base_gdf = gpd.read_file(shapefile_filename)
         
         # --- Verificación y Unificación de CRS ---
@@ -476,25 +474,23 @@ else:
 
         # --- Generación del Mapa ---
         print("Generando mapa de calor de las predicciones sobre el mapa base...")
-        fig, ax = plt.subplots(figsize=(15, 12)) # Hacer el mapa más grande
+        fig, ax = plt.subplots(figsize=(15, 12)) 
         
-        # 1. Dibujar el mapa base (polígonos)
         mapa_base_gdf.plot(
             ax=ax,
-            color='#E0E0E0',      # Color de relleno gris claro
-            edgecolor='white',    # Color del borde blanco
+            color='#E0E0E0',
+            edgecolor='white',
             linewidth=0.5
         )
         
-        # 2. Dibujar los puntos de predicción encima
         gdf.plot(
-            column='predicted_eggs', # La columna a mapear
+            column='predicted_eggs', 
             ax=ax,
-            legend=True,             # Mostrar la barra de color
-            cmap='YlOrRd',           # Mapa de color (Amarillo-Naranja-Rojo)
-            markersize=20,           # Tamaño del punto
-            legend_kwds={'label': "Cantidad de Huevos Predichos", 'shrink': 0.8}, # Etiqueta y tamaño de leyenda
-            alpha=0.75               # Hacer puntos un poco transparentes
+            legend=True,
+            cmap='YlOrRd',
+            markersize=20,
+            legend_kwds={'label': "Cantidad de Huevos Predichos", 'shrink': 0.8},
+            alpha=0.75
         )
         
         ax.set_title("Mapa de Predicciones de Huevos de Dengue (sobre mapa base)")
