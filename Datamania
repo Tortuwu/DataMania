@@ -16,22 +16,47 @@
 #  1. Importar librerías
 # =======================
 print("--- 1. Importando librerías ---")
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-# from google.colab import files  <- ELIMINADA
-from scipy.spatial import cKDTree
-from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from xgboost import XGBRegressor
+import os # Es buena idea importar 'os' fuera del 'try' si lo usas en el 'except'
 import warnings
-import os # Para la instalación silenciosa
-# *** NUEVO ***
-# import zipfile # Descomentar si necesitas descomprimir
-import geopandas as gpd # Mover importación aquí para usarla antes
-from pysal.lib import weights
-from pysal.explore import esda
-from splot.esda import lisa_cluster
+
+try:
+    # --- 1. Intenta importar todas las librerías ---
+    import pandas as pd
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from scipy.spatial import cKDTree
+    from sklearn.model_selection import train_test_split, GridSearchCV
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+    from xgboost import XGBRegressor
+    
+    # Librerías Geoespaciales
+    import geopandas as gpd 
+    from pysal.lib import weights
+    from pysal.explore import esda
+    from splot.esda import lisa_cluster
+    
+    print("✅ Librerías cargadas exitosamente.")
+
+except ImportError as e:
+    # --- 2. Si CUALQUIER importación falla, se ejecuta este bloque ---
+    print(f"⚠️ Error al importar la librería: {e}")
+    print("🔧 Intentando instalar las dependencias faltantes...")
+    
+    # Lista de todas las librerías a instalar
+    # (Asegúrate de incluir todas las que están en el 'try')
+    install_command = 'pip install pandas numpy matplotlib scipy scikit-learn xgboost geopandas pysal splot --quiet'
+    
+    try:
+        os.system(install_command)
+        print("\n✅ Instalación completada.")
+        print("👉 Por favor, RE-EJECUTA el script para cargar las nuevas librerías.")
+        exit() # Salir para que el kernel recargue las librerías instaladas
+        
+    except Exception as install_e:
+        print(f"❌ Falló la instalación automática: {install_e}")
+        print("👉 Intenta instalar manualmente el paquete mencionado en el error.")
+        exit()
+print("Iniciando análisis...")
 
 # Ignorar advertencias futuras
 warnings.simplefilter(action='ignore', category=FutureWarning)
